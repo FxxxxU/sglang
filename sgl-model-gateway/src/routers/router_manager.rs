@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -488,6 +488,18 @@ impl RouterTrait for RouterManager {
             router.get_model_info(req).await
         } else {
             (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+        }
+    }
+
+    async fn route_diffusion(
+        &self,
+        headers: &HeaderMap,
+        body: Bytes,
+        route: &'static str,
+    ) -> Response {
+        match self.select_router_for_request(Some(headers), None) {
+            Some(router) => router.route_diffusion(headers, body, route).await,
+            None => (StatusCode::SERVICE_UNAVAILABLE, "No router available").into_response(),
         }
     }
 

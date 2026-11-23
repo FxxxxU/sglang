@@ -37,8 +37,13 @@ def _kwargs_to_cpu(d: Any) -> Any:
 
 
 class RolloutDenoisingMixin:
-
-    def _maybe_prepare_rollout(self, batch: Req):
+    def _maybe_prepare_rollout(
+        self,
+        batch: Req,
+        *,
+        sample_shape: tuple | None = None,
+        log_prob_mask: torch.Tensor | None = None,
+    ):
         """Prepare denoising loop for rollout."""
         scheduler = batch.scheduler
         if not isinstance(scheduler, SchedulerRLMixin):
@@ -53,6 +58,8 @@ class RolloutDenoisingMixin:
             scheduler.prepare_rollout(
                 batch=batch,
                 pipeline_config=self.server_args.pipeline_config,
+                sample_shape=sample_shape,
+                log_prob_mask=log_prob_mask,
             )
 
     def _maybe_collect_rollout_log_probs(self, batch: Req):

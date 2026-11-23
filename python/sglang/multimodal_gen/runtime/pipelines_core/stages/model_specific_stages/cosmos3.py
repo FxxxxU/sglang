@@ -152,8 +152,7 @@ def _resize_center_crop_uint8_cthw(
     """Resize and center-crop ``uint8 [3, T, H, W]`` transfer frames."""
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(
-            "Transfer frames must have shape [3, T, H, W], got "
-            f"{tuple(frames.shape)}"
+            f"Transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}"
         )
     orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
     scale = max(width / orig_w, height / orig_h)
@@ -178,8 +177,7 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
     """Pad ``[1, 3, T, H, W]`` with reflected temporal content."""
     if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
         raise ValueError(
-            "Transfer video must have shape [1, 3, T, H, W], got "
-            f"{tuple(video.shape)}"
+            f"Transfer video must have shape [1, 3, T, H, W], got {tuple(video.shape)}"
         )
     if target_frames <= 0:
         raise ValueError("Transfer target frame count must be positive")
@@ -242,8 +240,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         stride = frames_per_chunk - conditional_frames
         if stride <= 0:
             raise ValueError(
-                "num_conditional_frames must be smaller than "
-                "num_video_frames_per_chunk"
+                "num_conditional_frames must be smaller than num_video_frames_per_chunk"
             )
         remaining = total_frames - frames_per_chunk
         return 1 + math.ceil(remaining / stride), stride
@@ -1081,12 +1078,21 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         batch.timesteps = self.scheduler.timesteps
 
         if batch.rollout:
+            action_sigmas = None
+            if batch.sampling_params.action_mode == "policy":
+                # Action replay uses N equal intervals before flow shifting.
+                shift = float(flow_shift)
+                action_sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1)[:-1]
+                action_sigmas = (
+                    shift * action_sigmas / (1 + (shift - 1) * action_sigmas)
+                )
             prepare_rollout_request_scheduler(
                 batch,
                 self.scheduler,
                 explicit_shift=explicit_flow_shift,
                 num_inference_steps=num_inference_steps,
                 device=device,
+                sigmas=action_sigmas,
             )
 
         self.log_info(
@@ -1114,6 +1120,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """
 
     parallelism_type = StageParallelismType.REPLICATED
+    supports_action_rollout = True
 
     def __init__(
         self,
@@ -1519,18 +1526,60 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Rollout requests carry a per-request scheduler bound by the timestep stage.
         scheduler = batch.scheduler if batch.scheduler is not None else self.scheduler
+        action_rollout = batch.rollout and action_latents is not None
+        if action_rollout:
+            model_input_dtype = latents.dtype
+            if (
+                batch.sampling_params.action_mode != "policy"
+                or sound_latents is not None
+                or control_latents is not None
+                or server_args.enable_cfg_parallel
+                or guidance_scale != 1.0
+            ):
+                raise ValueError(
+                    "Action rollout requires action_mode='policy', guidance_scale=1, "
+                    "CFG parallelism disabled, and no sound/control latents"
+                )
+            if batch.rollout_sde_type != "sde" or batch.rollout_noise_level <= 0:
+                raise ValueError(
+                    "Action rollout requires SDE with positive noise_level"
+                )
+            if batch.rollout_log_prob_no_const:
+                raise ValueError(
+                    "Action rollout requires full Gaussian transition log densities"
+                )
+            cond_text_ids = cond_text_ids.expand(latents.shape[0], -1).contiguous()
+            cond_text_mask = cond_text_mask.expand(latents.shape[0], -1).contiguous()
+
         if batch.rollout:
-            if velocity_mask is not None or condition_latents is not None:
+            if not action_rollout and (
+                velocity_mask is not None or condition_latents is not None
+            ):
                 raise ValueError(
                     "Cosmos3 rollout supports T2V/T2I only; I2V/V2V "
                     "conditioned-frame re-blending breaks the Gaussian "
                     "transition assumption of the SDE log-prob math."
                 )
-            if action_latents is not None or sound_latents is not None:
-                raise ValueError(
-                    "Cosmos3 rollout does not support action/sound modalities."
+            if sound_latents is not None:
+                raise ValueError("Cosmos3 rollout does not support the sound modality.")
+            sample_shape = None
+            log_prob_mask = None
+            if action_rollout:
+                action_mask = (
+                    action_velocity_mask.expand_as(action_latents).bool().clone()
                 )
-            self._maybe_prepare_rollout(batch)
+                action_mask[..., action_raw_dim:] = False
+                log_prob_mask = torch.cat(
+                    [
+                        torch.zeros_like(latents, dtype=torch.bool).flatten(1),
+                        action_mask.flatten(1),
+                    ],
+                    dim=1,
+                )
+                sample_shape = tuple(log_prob_mask.shape)
+            self._maybe_prepare_rollout(
+                batch, sample_shape=sample_shape, log_prob_mask=log_prob_mask
+            )
             self._maybe_init_denoising_env_collection(
                 batch=batch,
                 pipeline_config=server_args.pipeline_config,
@@ -1569,7 +1618,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             sound_scheduler = copy.deepcopy(self.scheduler)
             sound_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
         action_scheduler = None
-        if action_latents is not None:
+        if action_latents is not None and not action_rollout:
             action_scheduler = copy.deepcopy(self.scheduler)
             action_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
         cfg_rank = get_classifier_free_guidance_rank() if enable_cfg_parallel else 0
@@ -1766,7 +1815,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 # No CFG this step (guidance off or outside the CFG window): a
                 # single conditional forward, run identically on every rank.
                 noise_pred = self._run_transformer(
-                    latents=latents,
+                    latents=latents.to(model_input_dtype)
+                    if action_rollout
+                    else latents,
                     timestep=timestep,
                     text_ids=cond_text_ids,
                     text_mask=cond_text_mask,
@@ -1777,7 +1828,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     max_text_seq_len=batch.extra["cond_text_seq_len"],
                     current_timestep=i,
                     sound_latents=sound_latents,
-                    action_latents=action_latents,
+                    action_latents=action_latents.to(model_input_dtype)
+                    if action_rollout
+                    else action_latents,
                     action_domain_ids=action_domain_ids,
                     action_noisy_mask=action_velocity_mask,
                     action_fps=action_fps,
@@ -1807,20 +1860,36 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if batch.rollout:
                 # Capture the pre-step x_{t_i} before the scheduler advances it.
                 batch._rollout_loop_step_index = i
+                rollout_sample, rollout_prediction = latents, noise_pred
+                if action_rollout:
+                    rollout_sample = torch.cat(
+                        [latents.flatten(1), action_latents.flatten(1)], dim=1
+                    ).float()
+                    rollout_prediction = torch.cat(
+                        [noise_pred.flatten(1), action_noise_pred.flatten(1)], dim=1
+                    ).float()
                 self._maybe_append_dit_trajectory_step(
                     batch=batch,
-                    latents=latents,
+                    latents=rollout_sample,
                     timestep_value=t,
                     step_index=i,
                 )
-                latents = scheduler.step(
-                    noise_pred,
+                rollout_sample = scheduler.step(
+                    rollout_prediction,
                     t,
-                    latents,
+                    rollout_sample,
                     generator=batch.generator,
                     batch=batch,
                     return_dict=False,
                 )[0]
+                if action_rollout:
+                    video_width = latents[0].numel()
+                    action_latents = rollout_sample[:, video_width:].reshape(
+                        action_latents.shape
+                    )
+                    latents = rollout_sample[:, :video_width].reshape(latents.shape)
+                else:
+                    latents = rollout_sample
             else:
                 latents = scheduler.step(
                     noise_pred,
@@ -1841,12 +1910,15 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     and action_raw_dim < action_noise_pred.shape[-1]
                 ):
                     action_noise_pred[..., action_raw_dim:] = 0.0
-                action_latents = action_scheduler.step(
-                    action_noise_pred,
-                    t,
-                    action_latents,
-                    return_dict=False,
-                )[0]
+                if not action_rollout:
+                    action_latents = action_scheduler.step(
+                        action_noise_pred,
+                        t,
+                        action_latents,
+                        return_dict=False,
+                    )[0]
+                if action_raw_dim is not None:
+                    action_latents[..., action_raw_dim:] = 0.0
                 if (
                     action_condition_latents is not None
                     and action_velocity_mask is not None
@@ -1873,9 +1945,14 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 self.step_profile()
 
         if batch.rollout:
+            rollout_sample = latents
+            if action_rollout:
+                rollout_sample = torch.cat(
+                    [latents.flatten(1), action_latents.flatten(1)], dim=1
+                )
             self._postprocess_rollout_outputs(
                 batch=batch,
-                latents=latents,
+                latents=rollout_sample,
                 num_inference_steps=len(timesteps),
                 final_timestep=timesteps.new_zeros(()).cpu(),
                 server_args=server_args,
@@ -2408,6 +2485,13 @@ class Cosmos3DecodingStage(PipelineStage):
             action_pred = batch.action_latents.float().cpu()
             if raw_action_dim is not None:
                 action_pred = action_pred[:, :, :raw_action_dim]
+            if getattr(batch, "rollout", False):
+                return OutputBatch(
+                    output=action_pred,
+                    action_pred=action_pred,
+                    rollout_trajectory_data=batch.rollout_trajectory_data,
+                    metrics=batch.metrics,
+                )
             stats_path = getattr(batch.sampling_params, "action_stats_path", None)
             if stats_path is not None:
                 method = getattr(

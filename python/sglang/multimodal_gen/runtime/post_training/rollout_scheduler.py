@@ -50,14 +50,21 @@ def prepare_rollout_request_scheduler(
     explicit_shift: float | None,
     num_inference_steps: int,
     device: torch.device,
+    sigmas: torch.Tensor | None = None,
 ) -> None:
     """Bind the per-request rollout scheduler and hand it a sigma grid.
 
     Without an explicit shift the rollout scheduler inherits the serving grid
     verbatim; an explicit shift selects a plain shifted grid instead.
+    Explicit sigmas override both grids and are not shifted again.
     """
-    scheduler = get_or_create_rollout_request_scheduler(batch, serving_scheduler)
-    if scheduler is not serving_scheduler:
+    scheduler = get_or_create_rollout_request_scheduler(
+        batch, serving_scheduler, isolate=sigmas is not None
+    )
+    if sigmas is not None:
+        scheduler.set_shift(1.0)
+        scheduler.set_timesteps(sigmas=sigmas.tolist(), device=device)
+    elif scheduler is not serving_scheduler:
         if explicit_shift is not None:
             # Unwarped base; the mapped scheduler's sigmas are already serving-shift warped.
             shift = float(explicit_shift)

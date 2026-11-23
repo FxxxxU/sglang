@@ -18,6 +18,7 @@ class RolloutSessionData:
     sigma_max: float = 0.0
     latents_shape: tuple | None = None
     noise_buffer: torch.Tensor | None = None
+    log_prob_mask: torch.Tensor | None = None
 
     local_log_prob_sum: list[torch.Tensor] = field(default_factory=list)
     local_log_prob_count: list[torch.Tensor] = field(default_factory=list)

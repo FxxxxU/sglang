@@ -434,8 +434,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     ),
                     log_reqs=[req],
                     return_req=False,
-                    save_output_paths=lambda output_batch, req=req: self._save_output_paths(
-                        req, output_batch
+                    save_output_paths=lambda output_batch, req=req: (
+                        self._save_output_paths(req, output_batch)
                     ),
                     error_context=f"grouped request {req.request_id}",
                     execution_start_time=group_start_time,
@@ -1183,6 +1183,8 @@ def run_scheduler_process(
     task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
     # For rank 0 worker only: pipes to receive results from slaves
     result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
+    *,
+    scheduler_cls: type | None = None,
 ) -> None:
     """
     The entry point for the worker process.
@@ -1204,10 +1206,13 @@ def run_scheduler_process(
     # start the scheduler event loop
     assert task_pipes_to_slaves is not None
     assert result_pipes_from_slaves is not None
-    from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+    if scheduler_cls is None:
+        from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+
+        scheduler_cls = Scheduler
 
     try:
-        scheduler = Scheduler(
+        scheduler = scheduler_cls(
             server_args,
             gpu_id=rank,
             port_args=port_args,

@@ -33,18 +33,26 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         """Release rollout-owned resources. Call when denoising ends or before a new rollout."""
         batch._rollout_session_data = None
 
-    def prepare_rollout(self, batch: Req, pipeline_config: Any = None) -> None:
+    def prepare_rollout(
+        self,
+        batch: Req,
+        pipeline_config: Any = None,
+        *,
+        sample_shape: tuple | None = None,
+        log_prob_mask: torch.Tensor | None = None,
+    ) -> None:
         """Enable rollout and set SDE/CPS params. Call once before the denoising loop."""
         if get_sp_world_size() > 1 and pipeline_config is None:
             raise RuntimeError(
                 "SP rollout requires pipeline_config to be passed to prepare_rollout()."
             )
+        if sample_shape is None and batch.latents is not None:
+            sample_shape = tuple(batch.latents.shape)
         batch._rollout_session_data = RolloutSessionData(
             pipeline_config=pipeline_config,
             sigma_max=self.sigmas[min(1, len(self.sigmas) - 1)].item(),
-            latents_shape=(
-                tuple(batch.latents.shape) if batch.latents is not None else None
-            ),
+            latents_shape=sample_shape,
+            log_prob_mask=log_prob_mask,
         )
 
     def already_prepared_rollout(self, batch) -> bool:
@@ -75,7 +83,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         model_output: torch.FloatTensor,
         generator: Union[torch.Generator, list[torch.Generator]],
     ) -> torch.FloatTensor:
-        """Generate variance noise for rollout. If generator is a list, use generator[i] for the i-th batch item."""
+        """Fill rollout noise from a shared generator or one generator per sample."""
         assert generator is not None, "Generator must be provided"
 
         rollout_session_data = self._get_rollout_session_data(batch)
@@ -84,23 +92,16 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         local_shape = tuple(model_output.shape)
 
         B = local_shape[0]
-        if isinstance(generator, torch.Generator):
-            assert B == 1, "Generator must be a list if batch size is not 1"
-            generator = [generator]
-        else:
-            assert (
-                len(generator) == B
-            ), "Generator list must have the same length as batch size"
-
         buffer = self._get_or_create_rollout_noise_buffer(
             rollout_session_data, rollout_session_data.latents_shape, device, dtype
         )
-        for i in range(B):
-            torch.randn(
-                rollout_session_data.latents_shape,
-                out=buffer[i : i + 1],
-                generator=generator[i],
-            )
+        if isinstance(generator, torch.Generator):
+            buffer.normal_(generator=generator)
+        else:
+            if len(generator) != B:
+                raise ValueError("Generator list must match the batch size")
+            for i in range(B):
+                buffer[i : i + 1].normal_(generator=generator[i])
 
         sharded_noise, _ = rollout_session_data.pipeline_config.shard_latents_for_sp(
             batch=batch, latents=buffer
@@ -136,9 +137,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
 
         if not log_prob_no_const and sde_type != "ode":
-            assert (
-                noise_level > 0
-            ), "True log-probability computation requires a non-zero noise level."
+            assert noise_level > 0, (
+                "True log-probability computation requires a non-zero noise level."
+            )
 
         dt = next_sigma - current_sigma
 
@@ -230,9 +231,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             # Only enforce the "no full log-prob with ODE" constraint when the
             # user explicitly chose ODE globally.
             if sde_type == "ode":
-                assert (
-                    log_prob_no_const
-                ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+                assert log_prob_no_const, (
+                    "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+                )
 
         else:
             raise ValueError(f"Unsupported sde_type: {sde_type}")
@@ -244,13 +245,25 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         )
 
         if log_prob_no_const or effective_sde_type == "ode":
-            log_prob_local_sum = log_prob_no_const_val.sum(dim=reduce_dims)
+            element_log_probs = log_prob_no_const_val
         else:
-            log_prob_local_sum = (
+            element_log_probs = (
                 log_prob_no_const_val / (2 * (noise_std_dev**2))
                 - torch.log(noise_std_dev)
                 - _LOG_SQRT_2PI
-            ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
+            )
+
+        mask = rollout_session_data.log_prob_mask
+        if mask is not None:
+            if tuple(mask.shape) != tuple(element_log_probs.shape):
+                raise ValueError("Rollout log-probability mask must match the sample")
+            element_log_probs = torch.where(mask, element_log_probs, 0.0)
+            local_elem_count = mask.sum(dim=reduce_dims).float()
+            if (local_elem_count == 0).any():
+                raise ValueError(
+                    "Each rollout sample needs an active log-probability element"
+                )
+        log_prob_local_sum = element_log_probs.sum(dim=reduce_dims)
 
         if debug_mode:
             self.append_local_rollout_debug_tensors(

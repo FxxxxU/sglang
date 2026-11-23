@@ -444,6 +444,8 @@ class GroupCoordinator:
         ):
             return torch.ops.sgl_kernel.shm_allgather(input_, dim)
         else:
+            if not input_.is_contiguous():
+                input_ = input_.contiguous()
             all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:

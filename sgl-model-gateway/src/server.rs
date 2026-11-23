@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -167,6 +168,28 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_model_info(req).await
+}
+
+async fn rollout_generate(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    state
+        .router
+        .route_diffusion(&headers, body, "/rollout/generate")
+        .await
+}
+
+async fn action_generate(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    state
+        .router
+        .route_diffusion(&headers, body, "/v1/actions/generations")
+        .await
 }
 
 async fn generate(
@@ -543,6 +566,8 @@ pub fn build_app(
 ) -> Router {
     let protected_routes = Router::new()
         .route("/generate", post(generate))
+        .route("/rollout/generate", post(rollout_generate))
+        .route("/v1/actions/generations", post(action_generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/rerank", post(v1_rerank))

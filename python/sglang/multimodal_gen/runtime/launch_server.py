@@ -5,9 +5,9 @@ import multiprocessing as mp
 import os
 import sys
 import time
+from collections.abc import Callable
 
 import uvicorn
-
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
@@ -93,9 +93,11 @@ def _kill_alive_processes(processes, timeout_s: float) -> None:
     _join_processes_with_deadline(alive, timeout_s)
 
 
-def _run_http_server_process(server_args: ServerArgs) -> None:
+def _run_http_server_process(
+    server_args: ServerArgs, app_factory: Callable = create_app
+) -> None:
     kill_itself_when_parent_died()
-    launch_http_server_only(server_args)
+    launch_http_server_only(server_args, app_factory=app_factory)
 
 
 def _request_monolithic_scheduler_shutdown(server_args: ServerArgs) -> None:
@@ -129,7 +131,13 @@ def shutdown_scheduler_processes(
     _kill_alive_processes(alive, _WORKER_KILL_TIMEOUT_S)
 
 
-def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
+def launch_server(
+    server_args: ServerArgs,
+    launch_http_server: bool = True,
+    *,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+    app_factory: Callable = create_app,
+):
     """
     Args:
         launch_http_server: False for offline local mode
@@ -177,7 +185,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         scheduler_pipe_writers.append(writer)
         if i == 0:  # This node's local pipe master
             process = mp.Process(
-                target=run_scheduler_process,
+                target=run_scheduler_process_func,
                 args=(
                     i,  # local_rank
                     rank,
@@ -194,7 +202,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             )
         else:  # Slave workers
             process = mp.Process(
-                target=run_scheduler_process,
+                target=run_scheduler_process_func,
                 args=(
                     i,  # local_rank
                     rank,
@@ -277,14 +285,14 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             logger.info("Launch FastAPI server in another process because of webui.")
             http_server_process = mp.Process(
                 target=_run_http_server_process,
-                args=(server_args,),
+                args=(server_args, app_factory),
                 name="sglang-diffusion-webui",
                 daemon=True,
             )
             http_server_process.start()
         else:
             try:
-                launch_http_server_only(server_args)
+                launch_http_server_only(server_args, app_factory=app_factory)
             finally:
                 shutdown_scheduler_processes(server_args, processes)
 
@@ -529,12 +537,12 @@ def _run_disagg_role_process(
     )
 
 
-def launch_http_server_only(server_args):
+def launch_http_server_only(server_args, *, app_factory: Callable = create_app):
     init_diffusion_tracing(server_args, "DiffHTTPServer")
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
-    app = create_app(server_args)
+    app = app_factory(server_args)
     uvicorn.run(
         app,
         use_colors=True,
@@ -662,7 +670,7 @@ def launch_disagg_role(server_args: ServerArgs):
     role_type = server_args.disagg_role
     if server_args.disagg_server_addr is None:
         raise ValueError(
-            "--disagg-server-addr is required for --disagg-role " f"{role_type.value}"
+            f"--disagg-server-addr is required for --disagg-role {role_type.value}"
         )
 
     # Derive endpoints
@@ -809,14 +817,23 @@ def launch_disagg_role(server_args: ServerArgs):
         shutdown_scheduler_processes(role_args, processes, request_shutdown=False)
 
 
-def dispatch_launch(server_args: ServerArgs):
+def dispatch_launch(
+    server_args: ServerArgs,
+    *,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+    app_factory: Callable = create_app,
+):
     """Route to the correct launch function based on --disagg-role."""
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
 
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:
-        launch_server(server_args)
+        launch_server(
+            server_args,
+            run_scheduler_process_func=run_scheduler_process_func,
+            app_factory=app_factory,
+        )
     elif role == RoleType.SERVER:
         launch_disagg_server(server_args)
     elif role in (RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER):

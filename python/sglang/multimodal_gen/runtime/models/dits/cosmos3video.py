@@ -1529,10 +1529,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         action_frames = 0
         if action_latents is not None:
-            if self.sp_size > 1:
-                raise NotImplementedError(
-                    "Cosmos3 action generation does not support sequence parallelism yet"
-                )
             action_frames = action_latents.shape[1]
             if action_domain_ids is None:
                 action_domain_ids = torch.zeros(
@@ -1628,7 +1624,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_gen = hidden_gen.view(
                     batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
+                hidden_gen = hidden_gen[:, self.sp_rank, :, :].contiguous()
                 if token_noisy_mask is not None:
                     token_noisy_mask = token_noisy_mask.view(
                         batch_size, self.sp_size, local_seq_len, 1
@@ -1680,6 +1676,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
             seq_len_orig = hidden_gen.shape[1]
             if sequence_shard_enabled:
+                if action_latents is not None and seq_len_orig % self.sp_size != 0:
+                    raise ValueError(
+                        f"Cosmos3 action SP requires the combined GEN sequence length "
+                        f"{seq_len_orig} divisible by SP size {self.sp_size}"
+                    )
                 if seq_len_orig % self.sp_size != 0:
                     seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
                     pad = torch.zeros(
@@ -1692,7 +1693,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_gen = hidden_gen.view(
                     batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
+                hidden_gen = hidden_gen[:, self.sp_rank, :, :].contiguous()
 
         self._ensure_cache_dicts()
 

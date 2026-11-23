@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -744,6 +744,61 @@ impl RouterTrait for Router {
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         self.proxy_get_request(req, "model_info").await
+    }
+
+    async fn route_diffusion(
+        &self,
+        headers: &HeaderMap,
+        body: Bytes,
+        route: &'static str,
+    ) -> Response {
+        if self.dp_aware || self.enable_igw {
+            return error::bad_request(
+                "unsupported_diffusion_routing",
+                "Diffusion endpoints require regular HTTP replicas without IGW or internal DP routing",
+            );
+        }
+        let worker = match self
+            .select_worker_for_model(None, None, Some(headers))
+            .await
+        {
+            Some(worker) => worker,
+            None => {
+                return error::service_unavailable("no_available_workers", "No available workers")
+            }
+        };
+        let _load_guard = WorkerLoadGuard::new(worker.clone(), Some(headers));
+        let mut upstream_headers = headers.clone();
+        inject_trace_context_http(&mut upstream_headers);
+        let mut request = header_utils::apply_request_headers(
+            &upstream_headers,
+            self.client
+                .post(format!("{}{}", worker.url(), route))
+                .body(body),
+            false,
+        );
+        if let Some(key) = worker.api_key() {
+            request = request.bearer_auth(key);
+        }
+        // Stochastic action generation is sent once; retries can draw a different policy sample.
+        let result = match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = header_utils::preserve_response_headers(response.headers());
+                match response.bytes().await {
+                    Ok(body) => {
+                        let mut response = Response::new(Body::from(body));
+                        *response.status_mut() = status;
+                        *response.headers_mut() = headers;
+                        response
+                    }
+                    Err(error) => convert_reqwest_error(error),
+                }
+            }
+            Err(error) => convert_reqwest_error(error),
+        };
+        worker.record_outcome(result.status().is_success());
+        result
     }
 
     async fn route_generate(

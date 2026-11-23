@@ -4,7 +4,7 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -72,6 +72,20 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Get model info not implemented",
+        )
+            .into_response()
+    }
+
+    /// Forward a diffusion/action request without imposing an LLM schema.
+    async fn route_diffusion(
+        &self,
+        _headers: &HeaderMap,
+        _body: Bytes,
+        _route: &'static str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Diffusion requires a regular HTTP router",
         )
             .into_response()
     }

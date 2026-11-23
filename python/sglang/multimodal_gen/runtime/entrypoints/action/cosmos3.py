@@ -238,5 +238,10 @@ def build_cosmos3_action_sampling_params(
             if name in supported_fields and value is not None
         }
     )
+    sampling_params._explicit_fields = {
+        name
+        for name, value in sampling_kwargs.items()
+        if name in supported_fields and value is not None
+    }
     sampling_params._adjust(server_args)
     return sampling_params
